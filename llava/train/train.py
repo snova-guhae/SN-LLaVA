@@ -19,26 +19,27 @@ import copy
 from dataclasses import dataclass, field
 import json
 import logging
+from datasets import load_dataset
 import pathlib
 from typing import Dict, Optional, Sequence, List
 
 import torch
-from datasets import load_dataset
 
 import transformers
+from transformers import EarlyStoppingCallback
 import tokenizers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
-from llava.model.builder import load_pretrained_model
+
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
 
-
+import pickle 
 local_rank = None
 
 
@@ -66,11 +67,13 @@ class ModelArguments:
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
 
-
+    
 @dataclass
 class DataArguments:
-    data_path: str = field(default=None,
+    data_path: List[str] = field(default=None,
                            metadata={"help": "Path to the training data."})
+    eval_data_path:  List[str] = field(default=None,
+                                 metadata={"help": "Path to the evaluation data."})
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
@@ -84,6 +87,8 @@ class TrainingArguments(transformers.TrainingArguments):
     remove_unused_columns: bool = field(default=False)
     freeze_mm_mlp_adapter: bool = field(default=False)
     mpt_attn_impl: Optional[str] = field(default="triton")
+    train_vision_tower: bool = field(default=False)
+    early_stopping: bool = field(default=False)
     model_max_length: int = field(
         default=512,
         metadata={
@@ -186,6 +191,7 @@ def find_all_linear_names(model):
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
+
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
         keys_to_match = ['mm_projector']
@@ -210,7 +216,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         torch.cuda.synchronize()
         trainer.save_model(output_dir)
         return
-    
+
     state_dict = trainer.model.state_dict()
     if trainer.args.should_save:
         cpu_state_dict = {
@@ -219,6 +225,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         }
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+
 
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
@@ -415,9 +422,11 @@ def preprocess_v1(
     tokenizer: transformers.PreTrainedTokenizer,
     has_image: bool = False
 ) -> Dict:
+    with open("for_etash.pkl", "wb") as f:
+        pickle.dump((sources[:10], tokenizer, has_image), f)
+
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
-
     # Apply prompt templates
     conversations = []
     for i, source in enumerate(sources):
@@ -431,7 +440,11 @@ def preprocess_v1(
             assert role == conv.roles[j % 2], f"{i}"
             conv.append_message(role, sentence["value"])
         conversations.append(conv.get_prompt())
-
+    # print(conversations[0])
+    # print(sources[0])
+    # print(conversations[0])
+    # print(conversations[0].split(conv.sep2))
+    
     # Tokenize conversations
 
     if has_image:
@@ -448,7 +461,7 @@ def preprocess_v1(
     targets = input_ids.clone()
 
     assert conv.sep_style == conversation_lib.SeparatorStyle.TWO
-
+    
     # Mask targets
     sep = conv.sep + conv.roles[1] + ": "
     for conversation, target in zip(conversations, targets):
@@ -483,6 +496,13 @@ def preprocess_v1(
         target[cur_len:] = IGNORE_INDEX
 
         if cur_len < tokenizer.model_max_length:
+            # if int(os.environ['LOCAL_RANK']) == 0:
+            #     print(int(os.environ['LOCAL_RANK']))
+            # print("________________")
+            # print(rounds)
+            # print(conv.sep2)
+            # print(conversation)
+            # print(target)
             if cur_len != total_len:
                 target[:] = IGNORE_INDEX
                 print(
@@ -654,19 +674,40 @@ def preprocess(
     return dict(input_ids=input_ids, labels=targets)
 
 
+
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, data_path: str,
+    def __init__(self, data_path: List[str],
                  tokenizer: transformers.PreTrainedTokenizer,
                  data_args: DataArguments,
                  split='train'):
         super(LazySupervisedDataset, self).__init__()
-        try: 
-            dataset = load_dataset(data_path, split=split)
-            list_data_dict = [dict(row) for row in dataset]
-        except:
-            list_data_dict = json.load(open(data_path, "r"))
+        
+        list_data_dict = []
+        print(f"split {split}")
+        print(data_path)
+        for curr_data_path in data_path:
+            splits = load_dataset(curr_data_path).keys()
+            if len(splits) > 1:
+                if split == 'train':
+                    dataset = load_dataset(curr_data_path, split=split)
+                else:
+                    if 'val' in splits:
+                        dataset = load_dataset(curr_data_path, split='val')
+                    elif 'validation' in splits:
+                        dataset = load_dataset(curr_data_path, split='validation')
+                list_data_dict.extend([dict(row) for row in dataset])
+                del dataset 
+            else:
+                dataset = load_dataset(curr_data_path)['train'].train_test_split(.1, seed=42)
+                if split == 'train':
+                    list_data_dict.extend([dict(row) for row in dataset['train']])
+                else:
+                    list_data_dict.extend([dict(row) for row in dataset['val']])
+                del dataset
+        # except:
+        #     list_data_dict = json.load(open(data_path[0], "r"))
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
@@ -746,6 +787,8 @@ class LazySupervisedDataset(Dataset):
         return data_dict
 
 
+
+
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
@@ -783,16 +826,21 @@ class DataCollatorForSupervisedDataset(object):
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
+    
+    print(data_args.data_path)
+    print(data_args.eval_data_path)
+    
+    
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                 data_path=data_args.data_path,
                                 data_args=data_args)
-    try:
-        eval_dataset = LazySupervisedDataset(tokenizer=tokenizer,
-                                    data_path=data_args.data_path,
-                                    data_args=data_args,
-                                    split='val')
-    except:
-        eval_dataset = None
+    saved_eval_data_path = data_args.eval_data_path if data_args.eval_data_path is not None else data_args.data_path
+    print(saved_eval_data_path)
+    eval_dataset = LazySupervisedDataset(tokenizer=tokenizer,
+                                        data_path=saved_eval_data_path,
+                                        data_args=data_args,
+                                        split='val')
+    
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
@@ -846,7 +894,6 @@ def train(attn_implementation=None):
                 **bnb_model_from_pretrained_args
             )
     else:
-        
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
@@ -922,6 +969,11 @@ def train(attn_implementation=None):
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
+
+
+    data_module = make_supervised_data_module(tokenizer=tokenizer,
+                                              data_args=data_args)
+    
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(
             model_args=model_args,
@@ -930,7 +982,18 @@ def train(attn_implementation=None):
         
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
-
+        if training_args.train_vision_tower:
+            vision_tower.vision_tower.requires_grad_(True)
+        
+        if training_args.early_stopping:
+            early_stopping_callback = EarlyStoppingCallback(
+                early_stopping_patience=3,  # Stop training if the metric doesn't improve for 3 epochs
+                early_stopping_threshold=0.001  # Minimum change in the metric to qualify as an improvement
+            )
+            
+            training_args.callbacks = early_stopping_callback
+            print(f"Training Argument Early Stopping set True {training_args.callbacks}")
+            
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
 
@@ -971,12 +1034,12 @@ def train(attn_implementation=None):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
-    data_module = make_supervised_data_module(tokenizer=tokenizer,
-                                              data_args=data_args)
+    
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
